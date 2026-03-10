@@ -1,60 +1,91 @@
 # 🕵️‍♂️ Smart Business & Contact Scraper
 
-A high-performance asynchronous lead generation tool designed to bypass modern bot protections and intelligently categorize business websites using local LLMs.
+A professional, high-performance asynchronous tool for **Lead Generation** and **Business Intelligence**.  
+It bypasses modern bot protections (like Cloudflare) and uses a **local LLM (Ollama)** to intelligently categorize website niches based on their content.
 
-## 🚀 Key Features
+---
 
-* **Multi-Stage Fetching Pipeline**:
-    * **Level 1: aiohttp** – Lightning-fast raw HTML fetching for unprotected sites.
-    * **Level 2: cloudscraper** – Bypasses Cloudflare TLS fingerprinting and basic challenges.
-    * **Level 3: Playwright (Stealth)** – Full browser emulation to solve complex JS challenges and decode obfuscated emails.
-* **AI-Powered Categorization**: Integrates with **Ollama** (local LLM) to analyze website content and determine the business niche automatically.
-* **Tiered Email Extraction**: Prioritizes high-value contacts (e.g., `ceo@`, `advertising@`, `marketing@`) over generic addresses (`info@`).
-* **Resilience & Stability**: 
-    * **DNS Pre-check**: Skips dead domains before wasting resources.
-    * **Batch Processing**: Periodically recreates browser contexts to prevent memory leaks.
-    * **Heartbeat Monitor**: Automatically cancels and logs stalled tasks.
+# 🚀 Key Features
 
+## Multi-Stage Fetching Pipeline
 
+**Tier 1: aiohttp**  
+Ultra-fast raw HTML fetching for unprotected sites.
 
-## 🛠 Setup & Installation
+**Tier 2: cloudscraper**  
+Specialized bypass for Cloudflare TLS fingerprinting.
 
-### 1. Prerequisites
-* **Python 3.9+**
-* **Ollama** (installed and running)
-* **Windows/Linux/macOS**
+**Tier 3: Playwright (Stealth)**  
+Full browser emulation to solve JavaScript challenges and decode protected emails.
 
-### 2. Install Dependencies
-pip install asyncio aiohttp pandas beautifulsoup4 playwright cloudscraper openai openpyxl
-python -m playwright install chromium
+---
 
-# 🕵️‍♂️ Smart Business & Contact Scraper
+## AI-Powered Categorization
 
-Профессиональный асинхронный инструмент для поиска лидов, способный обходить современные защиты (Cloudflare) и классифицировать сайты с помощью локальных нейросетей.
+Integrated with **Ollama (local LLM)** to analyze website text and automatically determine the business niche.
 
-## 🚀 Основные возможности
+Examples:
+- Marketing Agency
+- E-commerce
+- SaaS
 
-* **Многоуровневый конвейер сбора данных**:
-    * **Уровень 1: aiohttp** – Максимальная скорость для незащищенных страниц.
-    * **Уровень 2: cloudscraper** – Обход базовой защиты Cloudflare на уровне TLS-отпечатков.
-    * **Уровень 3: Playwright (Stealth)** – Эмуляция реального браузера для выполнения JS и расшифровки скрытых email (CF Email Protection).
-* **Интеллектуальная классификация**: Интеграция с **Ollama** (локальный LLM) для автоматического определения ниши бизнеса на основе текстового контента.
-* **Приоритезация Email**: Система ищет наиболее ценные контакты (`ceo@`, `sales@`, `marketing@`) и ставит их на первое место.
-* **Надежность**: 
-    * **DNS Pre-check**: Предварительная проверка доступности домена для экономии ресурсов.
-    * **Batch Processing**: Перезапуск контекста браузера каждые 10 сайтов для предотвращения утечек памяти.
-    * **Heartbeat**: Защита от зависания отдельных задач.
+---
 
+## Smart Contact Extraction
 
+Prioritizes **high-value business emails** over generic ones.
 
-## 🛠 Настройка и установка
+High priority:
+- `ceo@`
+- `advertising@`
+- `partnership@`
 
-### 1. Требования
-* **Python 3.9+**
-* **Ollama** (установлена и запущена)
-* **Chromium** для Playwright
+Low priority:
+- `info@`
+- `office@`
 
-### 2. Установка зависимостей
+---
+
+## Industrial-Grade Stability
+
+**DNS Pre-check**  
+Quickly skips dead or unreachable domains.
+
+**Batch Processing**  
+Periodically refreshes browser contexts to prevent memory leaks.
+
+**Heartbeat Monitor**  
+Detects and cancels stalled tasks so the scraper never hangs.
+
+---
+
+# 🛠 Installation Guide
+
+Follow these steps to set up the environment on **Windows, Linux, or macOS**.
+
+---
+
+# 1. Prerequisites
+
+- Python **3.9+**
+- **Ollama** (installed and running)
+- **Excel** (to prepare input and view results)
+
+---
+
+# 2. Setup Environment & Libraries
+
+It is recommended to use a **virtual environment**.
+
 ```bash
+# Create and activate virtual environment
+python -m venv venv
+
+# Linux / macOS
+source venv/bin/activate
+
+# Windows
+venv\Scripts\activate
+
+# Install Python dependencies
 pip install asyncio aiohttp pandas beautifulsoup4 playwright cloudscraper openai openpyxl
-python -m playwright install chromium
