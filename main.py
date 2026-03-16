@@ -1,4 +1,5 @@
-﻿import asyncio
+import asyncio
+import sys
 import gc
 import logging
 import time
@@ -16,11 +17,15 @@ from openai import AsyncOpenAI
 import random
 from enum import Enum, auto
 from typing import Optional
+import concurrent.futures
 from urllib.parse import urljoin, urlparse
 import cloudscraper
 import cloudscraper.exceptions as cf_exc
 from requests import Response as RequestsResponse
 from requests.exceptions import ConnectTimeout, ReadTimeout
+import urllib.robotparser
+import dns.resolver
+import dns.exception
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,8 +60,18 @@ def _silence_playwright_noise(loop, context):
 
 
 # Configuration
-INPUT_FILE = "sites_to_check.xlsx"
-OUTPUT_FILE = "leads_result.xlsx"
+def get_base_path():
+    # If this is an EXE built by Nuitka or PyInstaller
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    # If this is a regular .py run
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = get_base_path()
+
+# Build all paths relative to BASE_DIR
+INPUT_FILE = os.path.join(BASE_DIR, "sites_to_check.xlsx")
+OUTPUT_FILE = os.path.join(BASE_DIR, "leads_result.xlsx")
 
 # Emails to always ignore (e.g., github support, wix, sentry, example.com)
 SPAM_EMAILS = ["github.com", "sentry.io", "wixpress.com", "example.com", "yoursite.com", "domain.com", "email.com"]
@@ -70,12 +85,37 @@ TIER_2_EMAILS = [
     "info@", "office@", "hello@", "contact@"
 ]
 
+ROLE_KEYWORDS = [
+    "advertis", "media buyer", "media kit", "sponsor", "monetiz",
+    "commercial", "brand partner", "ad sales", "ad manager",
+    "editor", "editorial", "chief", "head of", "director",
+    "content manager", "managing",
+    "ceo", "coo", "founder", "co-founder", "owner", "president",
+    "partnership", "pr manager", "public relation", "press contact",
+    "media relation", "outreach",
+]
+
 FORCED_PATHS = [
     "/contact", "/contact-us", "/about", "/about-us",
     "/advertise", "/advertising", "/partnership", "/partners",
     "/team", "/our-team", "/press", "/media-kit",
     "/reach-us", "/get-in-touch", "/work-with-us",
 ]
+
+# ---------------------------------------------------------------------------
+# Blocking work limits (avoid unbounded thread growth)
+# ---------------------------------------------------------------------------
+DEFAULT_THREAD_WORKERS = max(4, min(32, (os.cpu_count() or 4) * 4))
+THREAD_WORKERS = int(os.environ.get("SCRAPER_THREAD_WORKERS", DEFAULT_THREAD_WORKERS))
+DNS_CONCURRENCY = int(os.environ.get("SCRAPER_DNS_CONCURRENCY", "10"))
+DNS_THREAD_WORKERS = int(os.environ.get("SCRAPER_DNS_THREAD_WORKERS", "8"))
+SCRAPER_THREAD_WORKERS = int(os.environ.get("SCRAPER_SCRAPER_THREAD_WORKERS", str(THREAD_WORKERS)))
+MAX_EMAIL_CONTEXT_CHARS = int(os.environ.get("SCRAPER_EMAIL_CONTEXT_CHARS", "1200"))
+
+SCRAPER_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=SCRAPER_THREAD_WORKERS)
+DNS_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=DNS_THREAD_WORKERS)
+SCRAPER_BLOCKING_SEM = asyncio.Semaphore(SCRAPER_THREAD_WORKERS)
+DNS_SEM = asyncio.Semaphore(DNS_CONCURRENCY)
 
 # Configure OpenAI (uses OPENAI_API_KEY environment variable by default)
 # For local LLMs (like Ollama), set OPENAI_BASE_URL to "http://localhost:11434/v1"
@@ -90,6 +130,10 @@ def normalize_url(domain: str) -> str:
     if not domain.startswith("http://") and not domain.startswith("https://"):
         return f"https://{domain}"
     return domain
+
+def canonical_domain(url: str) -> str:
+    parsed = urlparse(normalize_url(url))
+    return parsed.netloc.replace("www.", "").lower().rstrip("/")
 
 def load_domains(file_path: str) -> list[str]:
     """Reads domains from Excel, normalizes them, and removes duplicates."""
@@ -107,22 +151,32 @@ def load_domains(file_path: str) -> list[str]:
         
         # Normalize URLs
         df["Normalized_URL"] = df[column_name].apply(normalize_url)
+        df["Canonical_Domain"] = df["Normalized_URL"].apply(canonical_domain)
         
         # Deduplicate
-        unique_urls = df["Normalized_URL"].drop_duplicates().tolist()
+        df = df.drop_duplicates(subset=["Canonical_Domain"], keep="first")
+        unique_urls = df["Normalized_URL"].tolist()
         print(f"Loaded {len(unique_urls)} unique domains from {file_path}.")
         return unique_urls
     except Exception as e:
         print(f"Failed to read {file_path}: {e}")
         return []
 
-def save_results(results: list[dict], file_path: str):
+def save_results(results: list[dict], file_path: str, ordered_domains: Optional[list[str]] = None):
     """Saves the scraped results to an Excel file."""
     if not results:
         print("No results to save.")
         return
         
-    df = pd.DataFrame(results)
+    if ordered_domains:
+        order_map = {domain: idx for idx, domain in enumerate(ordered_domains)}
+        sorted_results = sorted(
+            results,
+            key=lambda r: order_map.get(r.get("Site URL", ""), 10**9),
+        )
+        df = pd.DataFrame(sorted_results)
+    else:
+        df = pd.DataFrame(results)
     
     # Reorder columns to match expected output
     expected_columns = ["Site URL", "Email", "Thematic"]
@@ -291,6 +345,8 @@ class CloudflareBypasser:
             self._sleep(attempt)
             logger.info("[%d/%d] cloudscraper -> %s", attempt + 1, self.max_retries, url)
 
+            self._scraper.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+
             try:
                 # Tuple timeout: (connect_timeout, read_timeout).
                 # Short connect timeout so unreachable hosts fail fast and
@@ -450,10 +506,7 @@ async def safe_cloudscraper(url: str, timeout: float = 35.0) -> Optional[str]:
     the background thread eventually finishes on its own.
     """
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(fetch_html_cloudscraper, url),
-            timeout=timeout,
-        )
+        return await run_blocking(fetch_html_cloudscraper, url, timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning("cloudscraper thread timed out after %.0fs for %s.", timeout, url)
         return None
@@ -474,6 +527,53 @@ async def safe_playwright(url: str, context, timeout: float = 35.0) -> Optional[
     except Exception as exc:
         logger.error("safe_playwright unexpected error for %s: %s", url, exc)
         return None
+
+async def run_blocking(
+    fn,
+    *args,
+    timeout: float | None = None,
+    sem: asyncio.Semaphore | None = None,
+    executor: concurrent.futures.ThreadPoolExecutor | None = None,
+):
+    """Run blocking work on a bounded thread pool with optional timeout."""
+    loop = asyncio.get_running_loop()
+    use_sem = sem or SCRAPER_BLOCKING_SEM
+    use_executor = executor or SCRAPER_THREAD_POOL
+    async with use_sem:
+        fut = loop.run_in_executor(use_executor, lambda: fn(*args))
+        if timeout is None:
+            return await fut
+        return await asyncio.wait_for(fut, timeout=timeout)
+
+async def validate_email_domain(email: str) -> bool:
+    """Validates an email address by checking the MX records of its domain."""
+    try:
+        domain = email.split("@")[1]
+        res = await run_blocking(
+            dns.resolver.resolve,
+            domain,
+            'MX',
+            timeout=5.0,
+            sem=DNS_SEM,
+            executor=DNS_THREAD_POOL,
+        )
+        return len(res) > 0
+    except Exception:
+        return False
+
+async def is_crawl_allowed(base_url: str, session: aiohttp.ClientSession) -> bool:
+    """Checks robots.txt to see if crawling is allowed."""
+    try:
+        robots_url = urljoin(base_url, "/robots.txt")
+        async with session.get(robots_url, timeout=5) as response:
+            if response.status == 200:
+                text = await response.text()
+                parser = urllib.robotparser.RobotFileParser()
+                parser.parse(text.splitlines())
+                return parser.can_fetch("*", base_url)
+        return True
+    except Exception:
+        return True
 
 async def precheck_domain(
     base_url: str,
@@ -545,6 +645,7 @@ async def scrape_domain(
         }
         
         all_emails = set()
+        all_contexts: dict[str, str] = {}
         best_content = ""
 
         # Fast DNS/HEAD precheck to skip dead domains early.
@@ -558,6 +659,15 @@ async def scrape_domain(
             result["_timing"] = timing
             return result
         
+        # Check robots.txt
+        robots_allowed = await is_crawl_allowed(base_url, session)
+        if not robots_allowed:
+            logger.info("Crawling disallowed by robots.txt for %s", base_url)
+            result["Thematic"] = "Robots.txt / Disallowed"
+            timing["total_s"] = round(time.monotonic() - t_start, 2)
+            result["_timing"] = timing
+            return result
+
         # Playwright Fallback Detectors
         cf_triggers = ["Just a moment...", "DDoS protection", "cf-browser-verification", "__cf_email__", "email-protection"]
 
@@ -593,6 +703,7 @@ async def scrape_domain(
             extracted = extract_page_content(homepage_html, base_url)
             timing["extract_s"] = round(time.monotonic() - t0, 2)
             all_emails.update(extracted["emails"])
+            all_contexts.update(extracted.get("email_contexts", {}))
             best_content = extracted["text_for_llm"]
             
             paths_to_scan = list(extracted.get("contact_links", set()))
@@ -614,7 +725,7 @@ async def scrape_domain(
             paths_to_scan = paths_to_scan[:2]
 
         # Early check on homepage emails
-        current_best = get_best_email(all_emails, site_domain)
+        current_best = get_best_email(all_emails, site_domain, email_contexts=all_contexts)
         if not (current_best and any(current_best.startswith(t1) for t1 in TIER_1_EMAILS)):
             for target_url in paths_to_scan:
                 if time.monotonic() >= subpage_scan_deadline:
@@ -641,20 +752,30 @@ async def scrape_domain(
 
                 extracted_sub = extract_page_content(html, target_url)
                 all_emails.update(extracted_sub["emails"])
+                all_contexts.update(extracted_sub.get("email_contexts", {}))
 
                 # Early exit if High Tier email found
-                current_best = get_best_email(all_emails, site_domain)
+                current_best = get_best_email(all_emails, site_domain, email_contexts=all_contexts)
                 if current_best and any(current_best.startswith(t1) for t1 in TIER_1_EMAILS):
                     break
 
         if homepage_html:
-            agency_emails = await extract_agency_emails(homepage_html, base_url, session, pw_context, fallback_triggered)
+            agency_emails, agency_contexts = await extract_agency_emails(homepage_html, base_url, session, pw_context, fallback_triggered)
             if agency_emails:
                 logger.info("Agency emails found for %s: %s", base_url, agency_emails)
                 all_emails.update(agency_emails)
+                all_contexts.update(agency_contexts)
 
-        # Finalize emails
-        result["Email"] = get_best_email(all_emails, site_domain)
+        # Finalize emails (concurrent MX validation)
+        async def _check_email(email):
+            if await validate_email_domain(email):
+                return email
+            return None
+            
+        valid_results = await asyncio.gather(*[_check_email(e) for e in all_emails])
+        all_emails = {e for e in valid_results if e is not None}
+
+        result["Email"] = get_best_email(all_emails, site_domain, email_contexts=all_contexts)
         
         # LLM email extraction removed; rely on direct extraction only.
 
@@ -873,7 +994,7 @@ async def main():
 
                 # Save after every batch - results are never lost on crash.
                 try:
-                    save_results(results, OUTPUT_FILE)
+                    save_results(results, OUTPUT_FILE, ordered_domains=domains)
                     logger.info(
                         "Batch %d/%d done. %d total results saved so far.",
                         batch_num, total_batches, len(results),
@@ -891,7 +1012,7 @@ async def main():
 
     # 3. Final save
     try:
-        save_results(results, OUTPUT_FILE)
+        save_results(results, OUTPUT_FILE, ordered_domains=domains)
         logger.info("All done. %d results written to %s.", len(results), OUTPUT_FILE)
     except Exception as e:
         logger.error("Final save failed: %s", e)
@@ -961,11 +1082,65 @@ def extract_emails(text: str, soup=None) -> set:
         
     return valid_emails
 
-def get_best_email(emails: set, site_domain: str = "") -> str:
+def extract_emails_with_context(text: str, soup=None) -> dict[str, str]:
+    max_scan_chars = 400_000
+    if len(text) > max_scan_chars:
+        text = text[:max_scan_chars]
+
+    clean_text = text
+    replacements = (
+        ("[at]", "@"), ("(at)", "@"), ("{at}", "@"), (" at ", "@"), (" @ ", "@"),
+        ("[dot]", "."), ("(dot)", "."), ("{dot}", "."), (" dot ", "."), (" . ", "."),
+        ("\\u0040", "@"), ("&#64;", "@"), ("%40", "@"),
+    )
+    for old, new in replacements:
+        clean_text = clean_text.replace(old, new)
+        clean_text = clean_text.replace(old.upper(), new)
+
+    email_pattern = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+    contexts = {}
+
+    for match in email_pattern.finditer(clean_text):
+        email = match.group(0).lower()
+        if "%" in email:
+            continue
+        if any(spam in email for spam in SPAM_EMAILS):
+            continue
+        if email.endswith(IGNORE_EXTENSIONS):
+            continue
+        
+        start_idx = max(0, match.start() - 200)
+        end_idx = min(len(clean_text), match.end() + 200)
+        context_str = clean_text[start_idx:end_idx]
+        
+        if email not in contexts:
+            contexts[email] = context_str[:MAX_EMAIL_CONTEXT_CHARS]
+        else:
+            combined = contexts[email] + " " + context_str
+            if len(combined) > MAX_EMAIL_CONTEXT_CHARS:
+                combined = combined[:MAX_EMAIL_CONTEXT_CHARS]
+            contexts[email] = combined
+            
+    return contexts
+
+def get_best_email(
+    emails: set,
+    site_domain: str = "",
+    email_contexts: dict[str, str] | None = None,
+) -> str:
     """Ranks and returns the best email from a set."""
     if not emails:
         return ""
         
+    if email_contexts is None:
+        email_contexts = {}
+        
+    def has_role_context(em: str) -> bool:
+        ctx = email_contexts.get(em, "").lower()
+        if not ctx:
+            return False
+        return any(rk in ctx for rk in ROLE_KEYWORDS)
+
     def is_domain_match(em: str) -> bool:
         if not site_domain or "@" not in em:
             return False
@@ -981,22 +1156,32 @@ def get_best_email(emails: set, site_domain: str = "") -> str:
         if any(email.startswith(t1) for t1 in TIER_1_EMAILS):
             return email
 
-    # Priority 3: Tier-2 prefix + domain matches the site
+    # Priority 3: has_role_context + domain matches the site
+    for email in emails:
+        if has_role_context(email) and is_domain_match(email):
+            return email
+            
+    # Priority 4: has_role_context + any domain
+    for email in emails:
+        if has_role_context(email):
+            return email
+
+    # Priority 5: Tier-2 prefix + domain matches the site
     for email in emails:
         if any(email.startswith(t2) for t2 in TIER_2_EMAILS) and is_domain_match(email):
             return email
 
-    # Priority 4: Tier-2 prefix + any domain
+    # Priority 6: Tier-2 prefix + any domain
     for email in emails:
         if any(email.startswith(t2) for t2 in TIER_2_EMAILS):
             return email
 
-    # Priority 5: any email + domain matches the site
+    # Priority 7: any email + domain matches the site
     for email in emails:
         if is_domain_match(email):
             return email
 
-    # Priority 6: any other email
+    # Priority 8: any other email
     return list(emails)[0]
 
 async def get_sitemap_contact_urls(base_url: str, session: aiohttp.ClientSession) -> list:
@@ -1019,60 +1204,68 @@ async def get_sitemap_contact_urls(base_url: str, session: aiohttp.ClientSession
             pass
     return list(urls)
 
-
-async def extract_agency_emails(html: str, base_url: str, session: aiohttp.ClientSession, pw_context, fallback_triggered: bool) -> set:
-    try:
-        agency_emails = set()
-        soup = BeautifulSoup(html, "html.parser")
-        base_domain = urlparse(base_url).netloc.replace('www.', '')
-        
-        agency_links = set()
-        keywords = ["contact", "advertis", "partner", "agency", "media kit"]
-        
-        for a in soup.find_all("a", href=True):
-            href = a.get("href", "").strip()
-            link_text = a.get_text(strip=True).lower()
-            if not href or href.startswith("tel:") or href.startswith("javascript:") or href.startswith("mailto:"):
-                continue
-                
-            if any(kw in href.lower() or kw in link_text for kw in keywords):
-                full_url = urljoin(base_url, href).split('#')[0]
-                link_domain = urlparse(full_url).netloc.replace('www.', '')
-                
-                if link_domain and link_domain != base_domain:
-                    agency_links.add(full_url)
+async def extract_agency_emails(html: str, base_url: str, session: aiohttp.ClientSession, pw_context, fallback_triggered: bool) -> tuple[set, dict]:
+    async def _impl():
+        try:
+            agency_emails = set()
+            agency_contexts = {}
+            soup = BeautifulSoup(html, "html.parser")
+            base_domain = urlparse(base_url).netloc.replace('www.', '')
+            
+            agency_links = set()
+            keywords = ["contact", "advertise", "advertising", "partner", "agency", "media kit"]
+            
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "").strip()
+                link_text = a.get_text(strip=True).lower()
+                if not href or href.startswith("tel:") or href.startswith("javascript:") or href.startswith("mailto:"):
+                    continue
                     
-        agency_domains_seen = set()
-        urls_to_scan = []
-        for link in agency_links:
-            link_domain = urlparse(link).netloc.replace('www.', '')
-            if link_domain not in agency_domains_seen:
-                agency_domains_seen.add(link_domain)
-                urls_to_scan.append(link)
-                if len(urls_to_scan) >= 1:
-                    break
+                if any(kw in href.lower() or kw in link_text for kw in keywords):
+                    full_url = urljoin(base_url, href).split('#')[0]
+                    link_domain = urlparse(full_url).netloc.replace('www.', '')
                     
-        cf_triggers = ["Just a moment...", "DDoS protection", "cf-browser-verification", "__cf_email__", "email-protection"]
-                    
-        for url in urls_to_scan:
-            page_html = None
-            if not fallback_triggered:
-                page_html = await fetch_html_aiohttp(url, session)
-                if page_html is None or any(trigger in page_html for trigger in cf_triggers):
-                    page_html = await safe_cloudscraper(url)
-                if page_html is None or any(trigger in page_html for trigger in cf_triggers):
+                    if link_domain and link_domain != base_domain:
+                        agency_links.add(full_url)
+                        
+            agency_domains_seen = set()
+            urls_to_scan = []
+            for link in agency_links:
+                link_domain = urlparse(link).netloc.replace('www.', '')
+                if link_domain not in agency_domains_seen:
+                    agency_domains_seen.add(link_domain)
+                    urls_to_scan.append(link)
+                    if len(urls_to_scan) >= 1:
+                        break
+                        
+            cf_triggers = ["Just a moment...", "DDoS protection", "cf-browser-verification", "__cf_email__", "email-protection"]
+                        
+            for url in urls_to_scan:
+                page_html = None
+                if not fallback_triggered:
+                    page_html = await fetch_html_aiohttp(url, session)
+                    if page_html is None or any(trigger in page_html for trigger in cf_triggers):
+                        page_html = await safe_cloudscraper(url)
+                    if page_html is None or any(trigger in page_html for trigger in cf_triggers):
+                        page_html = await safe_playwright(url, pw_context)
+                else:
                     page_html = await safe_playwright(url, pw_context)
-            else:
-                page_html = await safe_playwright(url, pw_context)
-                
-            if page_html:
-                extracted = extract_page_content(page_html, url)
-                agency_emails.update(extracted["emails"])
-                
-        return agency_emails
-    except Exception as e:
-        logger.error("extract_agency_emails error: %s", e)
-        return set()
+                    
+                if page_html:
+                    extracted = extract_page_content(page_html, url)
+                    agency_emails.update(extracted["emails"])
+                    agency_contexts.update(extracted.get("email_contexts", {}))
+                    
+            return agency_emails, agency_contexts
+        except Exception as e:
+            logger.error("extract_agency_emails _impl error: %s", e)
+            return set(), {}
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=20.0)
+    except asyncio.TimeoutError:
+        logger.warning("extract_agency_emails timed out for %s", base_url)
+        return set(), {}
 
 def extract_jsonld_emails(soup) -> set:
     emails = set()
@@ -1156,10 +1349,16 @@ def extract_page_content(html: str, base_url: str) -> dict:
     combined_content = f"Title: {title}\nDescription: {meta_desc}\nHeadings: {headings}\nContent: {text}"
     truncated_content = combined_content[:2500]
     
+    email_contexts = extract_emails_with_context(html, soup=soup)
+    emails.update(email_contexts.keys())
+    
+    soup.decompose()
+    
     return {
         "text_for_llm": truncated_content,
         "emails": emails,
-        "contact_links": contact_links
+        "contact_links": contact_links,
+        "email_contexts": email_contexts
     }
 
 # Phrases that indicate the LLM refused or couldn't classify
@@ -1181,9 +1380,36 @@ async def categorize_niche(content: str) -> str:
     )
     user_prompt = (
         "Classify this website text into its core industry.\n"
-        "Use one of these labels if it fits perfectly: News, E-commerce, SaaS, Law Firm, Healthcare, Marketing, Technology, Blog, Games, Casino.\n"
-        "If none fit, provide a 1-3 word specific description (e.g., 'Username Generator', 'Video Hosting'). Do NOT reply with the word 'Other'.\n\n"
-        f"Website text:\n{content[:1500]}\n\n"
+        "You MUST use one of these exact labels if the site fits the category:\n"
+        "News, E-commerce, SaaS, Law Firm, Healthcare, Marketing, Technology, Blog, Games, Casino.\n\n"
+        "CRITICAL RULE — Topic beats format:\n"
+        "A site can be a news/blog FORMAT but still belong to a specific topic category.\n"
+        "Always classify by TOPIC first, format second.\n\n"
+        "Matching rules (apply in this exact order, stop at first match):\n"
+        "1. Any gambling, betting, slots, poker, casino site → Casino\n"
+        "2. Any gaming site (mobile games, PC games, racing games, RPG, shooters,\n"
+        "   game reviews, game news, esports, game guides) → Games\n"
+        "3. Any site about sports (football, F1, racing, basketball, tennis,\n"
+        "   sports news, sports results, sports betting excluded) → Sports\n"
+        "4. Any blog, personal site, review site, opinion site → Blog\n"
+        "5. Any general news, media, journalism site (politics, world news,\n"
+        "   economy) → News\n"
+        "6. Any e-commerce, online shop, marketplace → E-commerce\n"
+        "7. Any SaaS, web app, software tool → SaaS\n"
+        "8. Any law, legal services site → Law Firm\n"
+        "9. Any health, medical, wellness site → Healthcare\n"
+        "10. Any marketing, SEO, ads agency site → Marketing\n"
+        "11. Any tech company, IT services site → Technology\n"
+        "12. If NONE match → provide a 1-3 word specific description.\n\n"
+        "Examples:\n"
+        "- F1 news site → Sports (not News)\n"
+        "- Gaming news site → Games (not News)\n"
+        "- Casino review blog → Casino (not Blog)\n"
+        "- Crypto news → Technology (not News)\n"
+        "- Recipe blog → Blog\n"
+        "- BBC, CNN, Reuters → News\n\n"
+        "Do NOT reply with the word 'Other'.\n\n"
+        f"Website text:\n{content[:3000]}\n\n"
         "Category:"
     )
 
@@ -1254,3 +1480,8 @@ if __name__ == "__main__":
     finally:
         if enable_hang_dump:
             faulthandler.cancel_dump_traceback_later()
+        try:
+            SCRAPER_THREAD_POOL.shutdown(wait=False, cancel_futures=True)
+            DNS_THREAD_POOL.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
