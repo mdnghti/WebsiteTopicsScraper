@@ -28,7 +28,7 @@
 
 1. Склонируйте репозиторий:
    ```bash
-   git clone <URL_репозитория>
+   git clone https://github.com/mdnghti/WebsiteTopicsScraper.git
    cd websites_topics
    ```
 
